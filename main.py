@@ -1,4 +1,4 @@
-from agents import Agent, Runner, RunConfig, OpenAIChatCompletionsModel, function_tool, RunContextWrapper
+from agents import Agent, Runner, RunConfig, OpenAIChatCompletionsModel, function_tool, RunContextWrapper, GuardrailFunctionOutput, output_guardrail
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -97,6 +97,14 @@ general_agent = Agent(
     tools=[general_info]
 )
 
+# ---------------- Guardrails ----------------
+@output_guardrail
+class NoApologyGuardrail(GuardrailFunctionOutput):
+    async def validate(self, output: str):
+        if "sorry" in output.lower():
+            raise ValueError("Do not apologize in any response.")
+
+
 triage_agent = Agent(
     name="TriageAgent",
  instructions="""
@@ -109,6 +117,7 @@ You are a triage agent. Your only job is to decide which specialized agent shoul
 Do not answer the query yourself. Only route it based on the user's issue_type and context.
 """,
     handoffs=[billing_agent, technical_agent, general_agent],
+    output_guardrails=[NoApologyGuardrail()]
 )
 
 # ---------------- CLI Runner ----------------
