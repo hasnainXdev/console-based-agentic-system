@@ -1,4 +1,15 @@
-from agents import Agent, Runner, RunConfig, OpenAIChatCompletionsModel, function_tool, RunContextWrapper, GuardrailFunctionOutput, output_guardrail
+from agents import (
+    Agent,
+    Runner,
+    RunConfig,
+    OpenAIChatCompletionsModel,
+    function_tool,
+    RunContextWrapper,
+    GuardrailFunctionOutput,
+    output_guardrail,
+    TResponseInputItem,
+    OutputGuardrailTripwireTriggered,
+)
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -23,11 +34,7 @@ model = OpenAIChatCompletionsModel(
     openai_client=external_client,
 )
 
-config = RunConfig(
-    model=model,
-    model_provider=external_client,
-    tracing_disabled=True
-)
+config = RunConfig(model=model, model_provider=external_client, tracing_disabled=True)
 
 
 # ---------------- Context ----------------
@@ -35,8 +42,12 @@ class UserContext(BaseModel):
     name: str
     is_premium_user: bool
     issue_type: str
-    
-    
+
+
+class ApologyOutput(BaseModel):
+    is_apology: bool
+
+
 # ---------------- Tools ----------------
 @function_tool
 async def refund(ctx: RunContextWrapper) -> str:
@@ -46,6 +57,7 @@ async def refund(ctx: RunContextWrapper) -> str:
 
 refund.is_enabled = lambda ctx, agent: ctx.context.is_premium_user
 
+
 @function_tool
 async def restart_service(ctx: RunContextWrapper) -> str:
     user_name = ctx.context.name
@@ -53,6 +65,7 @@ async def restart_service(ctx: RunContextWrapper) -> str:
 
 
 restart_service.is_enabled = lambda ctx, agent: ctx.context.issue_type == "technical"
+
 
 @function_tool
 async def general_info(ctx: RunContextWrapper) -> str:
@@ -63,26 +76,26 @@ async def general_info(ctx: RunContextWrapper) -> str:
 # ---------------- Specialized Agents ----------------
 billing_agent = Agent(
     name="BillingAgent",
-   instructions="""
+    instructions="""
 You are the BillingAgent.
 
 If the user requests a refund and they are a premium user, always call the refund tool.
 
 Do not respond with a message directly. Only use the refund tool to generate the response.
 """,
-    tools=[refund]
+    tools=[refund],
 )
 
 technical_agent = Agent(
     name="TechnicalAgent",
-      instructions="""
+    instructions="""
 You are the TechnicalAgent.
 
 If the user requests a service restart and the issue type is technical, always call the restart_service tool.
 
 Do not respond with a message directly. Only use the restart_service tool to generate the response.
 """,
-    tools=[restart_service]
+    tools=[restart_service],
 )
 
 general_agent = Agent(
@@ -94,20 +107,38 @@ general_agent = Agent(
 
     Do not respond with a message directly. Only use the general_info tool to generate the response.
     """,
-    tools=[general_info]
+    tools=[general_info],
 )
+
+
+# ---------------- guardrail Agent ---------------------
+
+guardrail_agent = Agent(
+    name="Guardrail Agent",
+    instructions="You are a guardrail agent that ensures that the final output does not contain apologies. for example sorry, I'm sorry or apologies etc, if you find one, return is_apology: True otherwise return is_apology: False",
+    output_type=ApologyOutput,
+)
+
 
 # ---------------- Guardrails ----------------
 @output_guardrail
-class NoApologyGuardrail(GuardrailFunctionOutput):
-    async def validate(self, output: str):
-        if "sorry" in output.lower():
-            raise ValueError("Do not apologize in any response.")
+async def NoApologyGuardrail(
+    ctx: RunContextWrapper[None], agent: Agent, input: str | list[TResponseInputItem]
+) -> GuardrailFunctionOutput:
+    result = await Runner.run(
+        guardrail_agent, input, run_config=config, context=ctx.context
+    )
+
+    return GuardrailFunctionOutput(
+        output_info=result.final_output,
+        tripwire_triggered=result.final_output.is_apology,
+    )
 
 
+# ------------ triage agent ------------------
 triage_agent = Agent(
     name="TriageAgent",
- instructions="""
+    instructions="""
 You are a triage agent. Your only job is to decide which specialized agent should handle the user query.
 
 - If the issue is about billing (e.g., refunds, payments), hand it off to billing_agent.
@@ -115,28 +146,41 @@ You are a triage agent. Your only job is to decide which specialized agent shoul
 - If it's a general question or not specific, hand it off to general_agent.
 
 Do not answer the query yourself. Only route it based on the user's issue_type and context.
+
+if the user is asking out of context say sorry
 """,
     handoffs=[billing_agent, technical_agent, general_agent],
-    output_guardrails=[NoApologyGuardrail()]
+    output_guardrails=[NoApologyGuardrail],
 )
+
 
 # ---------------- CLI Runner ----------------
 async def main():
     print("\nWelcome to the Support Agent System")
     name = input("Enter your name: ")
     is_premium_input = input("Are you a premium user? (yes/no): ").strip().lower()
-    issue_type = input("What type of issue are you facing? (billing/technical/general): ").strip().lower()
-    
+    issue_type = (
+        input("What type of issue are you facing? (billing/technical/general): ")
+        .strip()
+        .lower()
+    )
+
     is_premium = is_premium_input == "yes"
     context = UserContext(name=name, is_premium_user=is_premium, issue_type=issue_type)
 
     user_query = input("\nPlease describe your issue: ")
     print("\nRouting your query...\n")
 
-    result = await Runner.run(triage_agent, user_query, run_config=config, context=context)
+    try:
+        result = await Runner.run(
+            triage_agent, user_query, run_config=config, context=context
+        )
+        print("\nFinal Output:")
+        print(result.final_output)
+        # print("\n guardrail did not triggered")
 
-    print("\nFinal Output:")
-    print(result.final_output)
+    except OutputGuardrailTripwireTriggered:
+        print("\nTripwire triggered. Apology are not allowed")
 
 
 if __name__ == "__main__":
